@@ -7,6 +7,12 @@ on:
   # event on the workflow_call path. Manual verification keeps using
   # workflow_dispatch, which bypasses the PR-event gate.
   workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: "Run all PPU PR suites regardless of changed paths"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -53,7 +59,14 @@ jobs:
     # (workflow_dispatch) are unaffected: pr-gate's checks are PR-event-only.
     runs-on: ubuntu-latest
     outputs:
-      changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
+      # Keep the groups separate so future suites can select their own inputs.
+      # For now, any relevant group selects the full stage-a/b/c chain.
+      ppu_runtime: ${{ steps.filter.outputs.ppu_runtime == 'true' }}
+      ppu_tests: ${{ steps.filter.outputs.ppu_tests == 'true' }}
+      ppu_ci: ${{ steps.filter.outputs.ppu_ci == 'true' }}
+      changes_exist: ${{ steps.filter.outputs.ppu_runtime == 'true'
+        || steps.filter.outputs.ppu_tests == 'true'
+        || steps.filter.outputs.ppu_ci == 'true'
         || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
       - name: Checkout code
@@ -75,15 +88,58 @@ jobs:
         uses: dorny/paths-filter@v3
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
+          # File matching is authoritative; auto-labels are informational and
+          # may be stale or not yet applied. Never skip solely on documentation
+          # label presence: a mixed documentation/code PR must still run.
+          # Keep these groups aligned with .github/labeler.yml.
+          # Do NOT exclude all *.txt/JSON/YAML: requirements, CMakeLists.txt,
+          # test fixtures, and eval configs can affect PPU execution.
+          # AND the include union with every exclusion on each individual file.
+          # The default 'some' would let a negated pattern match unrelated files.
+          predicate-quantifier: every
           filters: |
-            ppu_code:
-              - ".github/workflows/pr-test-ppu.yml"
-              - "python/pyproject_other.toml"
-              - "python/sglang/!(multimodal_gen)/**"
-              - "python/sglang/srt/hardware_backend/ppu/**"
-              - "python/sglang/srt/platforms/ppu.py"
-              - "test/registered/**"
-              - "scripts/ci/ppu/**"
+            ppu_runtime:
+              - 'python/sglang/**'
+              - '!python/sglang/multimodal_gen/**'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+            ppu_tests:
+              - 'test/**'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+            ppu_ci:
+              - '{.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+
+      - name: Summarize PPU test selection
+        env:
+          PPU_RUNTIME: ${{ steps.filter.outputs.ppu_runtime || 'false' }}
+          PPU_TESTS: ${{ steps.filter.outputs.ppu_tests || 'false' }}
+          PPU_CI: ${{ steps.filter.outputs.ppu_ci || 'false' }}
+          RUN_ALL_TESTS: ${{ steps.run-mode.outputs.run_all_tests }}
+        run: |
+          {
+            echo '## PPU PR test selection'
+            echo '| Group | Matched |'
+            echo '| --- | --- |'
+            echo "| Runtime | $PPU_RUNTIME |"
+            echo "| Tests | $PPU_TESTS |"
+            echo "| CI / dependencies | $PPU_CI |"
+            echo "| Force all tests | $RUN_ALL_TESTS |"
+            echo ''
+            if [[ "$RUN_ALL_TESTS" == 'true' || "$PPU_RUNTIME" == 'true' || "$PPU_TESTS" == 'true' || "$PPU_CI" == 'true' ]]; then
+              echo 'Selected: stage-a, stage-b, stage-c (subject to the PR gate).'
+            else
+              echo 'No PPU-relevant executable/configuration changes: skip the PR gate and all PPU stages.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ==================== PR Gate ==================== #
   # The same reusable gate the CUDA/XPU lines call (`pr-gate.yml`): blocks
