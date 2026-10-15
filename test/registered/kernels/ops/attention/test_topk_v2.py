@@ -610,3 +610,28 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("width", [8192, 32768])
+@torch.inference_mode()
+def test_topk_v2_ragged_threshold_bin_overflow(width):
+    # #37941: the original FP32 path must refine an overflowing coarse bin.
+    k = 2048
+    rng = torch.Generator().manual_seed(37941)
+    scores = 1 + 0.02 * torch.rand((4, width), generator=rng)
+    scores[1] = 1e-30 * scores[1]
+    scores[2].fill_(0.5)
+    scores[3, :1024] = 1e-6
+    scores[3, 1024:].fill_(-0.0)
+    seq_lens = torch.full((4,), width, dtype=torch.int32, device="cuda")
+    out = torch.full((4, k), -2, dtype=torch.int32, device="cuda")
+    offsets = torch.zeros_like(seq_lens)
+    topk_transform_ragged_v2(
+        scores.cuda(), seq_lens, out_offsets=offsets, out_indices=out
+    )
+    assert torch.all((out >= 0) & (out < width))
+    indices = out.cpu().to(torch.int64)
+    sorted_indices = indices.sort(dim=-1).values
+    assert torch.all(sorted_indices[:, 1:] > sorted_indices[:, :-1])
+    selected = scores.gather(1, indices).sort(dim=-1).values
+    assert torch.equal(selected, scores.topk(k).values.flip(-1))
