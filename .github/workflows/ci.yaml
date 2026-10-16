@@ -48,7 +48,7 @@ jobs:
           node-version: '20'
       - name: Install CI filter test dependencies
         run: |
-          python3 -m pip install PyYAML==6.0.3
+          python3 -m pip install PyYAML==6.0.3 pytest==8.3.5
           npm install --prefix "$RUNNER_TEMP/ppu-ci-filter-tests" \
             --ignore-scripts --no-save --no-package-lock --no-audit --no-fund \
             picomatch@2.3.1 minimatch@9.0.5
