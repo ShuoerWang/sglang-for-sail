@@ -103,6 +103,7 @@ def get_deep_gemm_decode_data(
     assert indexer.n_local_heads == indexer.n_heads
     if (
         x.is_cuda
+        and not is_ppu()
         and torch.version.cuda is not None
         and x.dtype == torch.bfloat16
         and indexer.index_head_dim == 128
@@ -393,40 +394,53 @@ def decode_scores(
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
     use_paged = is_ppu()
     slots = None
-    if indexer.use_int8:
+    if use_paged:
+        from sglang.kernels.ops.attention.dsv4.index_logits import (
+            deep_gemm_fp4_paged_mqa_logits,
+        )
         from sglang.kernels.ops.attention.dsv4.int8_indexer import (
             int8_paged_index_logits,
         )
 
-        scores = int8_paged_index_logits(
-            q,
-            weights,
-            table,
-            metadata.compressed_seq_lens[:bs],
-            metadata.page_table[:bs],
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-            metadata.compressed_page_size,
-        )[:, :lmax]
-    elif use_paged:
-        from sglang.kernels.ops.attention.dsv4.index_logits import (
-            deep_gemm_fp4_paged_mqa_logits,
-        )
-
-        q_fp4, q_sf = quantize_index_q(q)
-        scores = deep_gemm_fp4_paged_mqa_logits(
-            (q_fp4.unsqueeze(1), q_sf.unsqueeze(1)),
-            get_index_k_cache(
+        if not indexer.use_int8:
+            q_fp4, q_sf = quantize_index_q(q)
+            k_cache = get_index_k_cache(
                 token_to_kv_pool=pool,
                 layer_id=inputs.layer_id,
                 page_size=metadata.compressed_page_size,
-            ),
-            weights.float(),
-            metadata.compressed_seq_lens[:bs],
-            metadata.page_table[:bs],
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-        )[:, :lmax]
+            )
+
+        def score_rows(rows, plan):
+            if indexer.use_int8:
+                return int8_paged_index_logits(
+                    q[rows],
+                    weights[rows],
+                    table,
+                    metadata.compressed_seq_lens[rows],
+                    metadata.page_table[rows],
+                    plan,
+                    metadata.max_compressed_seq_len,
+                    metadata.compressed_page_size,
+                )[:, :lmax]
+            return deep_gemm_fp4_paged_mqa_logits(
+                (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
+                k_cache,
+                weights[rows].float(),
+                metadata.compressed_seq_lens[rows],
+                metadata.page_table[rows],
+                plan,
+                metadata.max_compressed_seq_len,
+            )[:, :lmax]
+
+        if isinstance(metadata.deep_gemm_metadata, list):
+            scores = torch.empty((bs, lmax), dtype=torch.float32, device=q.device)
+            for rows, plan in metadata.row_chunks():
+                rows = slice(rows.start, min(rows.stop, bs))
+                if rows.start >= bs:
+                    break
+                scores[rows] = score_rows(rows, plan)
+        else:
+            scores = score_rows(slice(0, bs), metadata.deep_gemm_metadata)
     else:
         slots = (
             req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
