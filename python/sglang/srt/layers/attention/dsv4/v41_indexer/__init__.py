@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.utils import is_ppu
+from sglang.srt.utils import get_device_sm, is_ppu
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -117,7 +117,8 @@ def make_candidate_indexer(
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
-    if is_ppu() or not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+    supports_sparse = get_device_sm() >= 89 if is_ppu() else is_sm100_or_newer()
+    if not supports_sparse or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
