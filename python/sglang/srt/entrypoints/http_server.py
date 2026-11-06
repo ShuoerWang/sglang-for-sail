@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import inspect
 import logging
 import os
 import ssl
@@ -2805,6 +2806,11 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
+                worker_healthcheck_kwargs = {}
+                if "timeout_worker_healthcheck" in inspect.signature(uvicorn.run).parameters:
+                    worker_healthcheck_kwargs["timeout_worker_healthcheck"] = (
+                        envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get()
+                    )
                 uvicorn.run(
                     "sglang.srt.entrypoints.http_server:app",
                     host=get_serving().host,
@@ -2813,9 +2819,9 @@ def _setup_and_run_http_server(
                     log_level=get_observability().log_level_http
                     or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                     loop="uvloop",
                     workers=get_serving().tokenizer_worker_num,
+                    **worker_healthcheck_kwargs,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
