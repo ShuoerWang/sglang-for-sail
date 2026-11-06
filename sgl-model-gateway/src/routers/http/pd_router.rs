@@ -1789,6 +1789,50 @@ mod tests {
         Box::new(worker)
     }
 
+    #[tokio::test]
+    async fn test_pd_chat_preserves_engine_extensions() {
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "shared prefix"}],
+            "stream": true, "temperature": 1.0, "max_tokens": 200,
+            "cache_salt": "isolated-prefix", "return_cached_tokens": true,
+            "custom_engine_option": {"nested": [1, 2]}
+        }))
+        .unwrap();
+        let request = serde_json::to_value(&body).unwrap();
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let (p, d) = PDRouter::prepare_pd_worker_requests(
+            "/v1/chat/completions",
+            &request,
+            &prefill,
+            &decode,
+        )
+        .await
+        .unwrap();
+        for forwarded in [p.body, d.body] {
+            assert_eq!(forwarded["cache_salt"], "isolated-prefix");
+            assert_eq!(forwarded["return_cached_tokens"], true);
+            assert_eq!(forwarded["custom_engine_option"], json!({"nested": [1, 2]}));
+            assert_eq!(forwarded["stream"], true);
+            assert_eq!(forwarded["temperature"], 1.0);
+        }
+        let plain: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model", "messages": [{"role": "user", "content": "plain"}]
+        }))
+        .unwrap();
+        assert!(serde_json::to_value(plain)
+            .unwrap()
+            .get("cache_salt")
+            .is_none());
+    }
+
     #[test]
     fn test_chat_request_text_uses_full_conversation() {
         // Regression test for https://github.com/sgl-project/sglang/issues/26263
