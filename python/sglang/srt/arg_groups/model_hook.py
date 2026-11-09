@@ -157,6 +157,8 @@ def handle_model_specific_adjustments(server_args: Any):
         uses_mamba_radix_cache=False,
     )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        if cfg.dsv41_encoder_only_prefill:
+            raise ValueError("--dsv41-encoder-only-prefill requires a model checkpoint")
         # No model overrides for an instance connector: no hf_config to
         # key them on.
         return
@@ -164,6 +166,13 @@ def handle_model_specific_adjustments(server_args: Any):
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
+
+    if cfg.dsv41_encoder_only_prefill:
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            resolve_deepseek_v41_asymmetric_pd,
+        )
+
+        resolve_deepseek_v41_asymmetric_pd(server_args)
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
         unsupported = []
@@ -946,7 +955,6 @@ def handle_model_capability_adjustments(server_args: Any):
             f"Automatically turn off --chunked-prefill-size as it is not supported for "
             f"{hf_config.model_type}"
         )
-
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
     # Resolution moved to the resolution pipeline (arg_groups/overrides.py:

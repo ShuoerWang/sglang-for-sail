@@ -202,6 +202,100 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+def resolve_deepseek_v41_asymmetric_pd(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.dsv41_encoder_only_prefill:
+        return
+    if (
+        cfg.disaggregation_mode not in ("prefill", "decode")
+        or cfg.disaggregation_transfer_backend != "mooncake"
+    ):
+        raise ValueError("--dsv41-encoder-only-prefill requires Mooncake PD")
+
+    hf_config = model_config_of(server_args).hf_config
+    # Match the Flash backbone, including locally renamed and quantized checkpoints.
+    if (
+        hf_config.model_type != "deepseek_v41"
+        or hf_config.num_hidden_layers != 40
+        or hf_config.hidden_size != 5120
+        or hf_config.n_routed_experts != 384
+    ):
+        raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1-Flash")
+
+    boundary = max(hf_config.kv_source_layer_ids, default=-1)
+    # An even split leaves no pending compressor state only up to ratio 2; a
+    # c4 or c128 layer would need its partial block transferred.
+    target_ratios = hf_config.compress_ratios[: hf_config.num_hidden_layers]
+    if any(ratio not in (0, 1, 2) for ratio in target_ratios):
+        raise ValueError(
+            "DeepSeek-V4.1 asymmetric PD requires compression ratios 0, 1 and 2 only"
+        )
+    if (
+        not 0 <= boundary < len(target_ratios)
+        or target_ratios[boundary] not in (1, 2)
+        or boundary not in hf_config.index_source_layer_ids
+        or boundary in hf_config.engram_layer_ids
+        or not hf_config.hc_pre_from_prev_sublayer
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 asymmetric PD requires the last KV source layer to own "
+            "ratio-1/2 Main-KV and Indexer-K, not to be an Engram layer, and the "
+            "shifted mHC topology"
+        )
+    is_decode = cfg.disaggregation_mode == "decode"
+    if is_decode and cfg.moe_a2a_backend == "deepep" and cfg.deepep_mode == "low_latency":
+        window_size = getattr(hf_config, "sliding_window", None) or hf_config.window_size
+        max_dispatch = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        if max_dispatch < window_size + 1:
+            raise ValueError(
+                "DeepSeek-V4.1 asymmetric PD needs "
+                f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK >= {window_size + 1} "
+                "with DeepEP low_latency to fit a complete prompt tail."
+            )
+    incompatible = (
+        ("runtime PD role switching", cfg.enable_pd_role_switch),
+        # Prefill has no lm_head; decode drafts from its own tail extend.
+        (
+            "speculative decoding on prefill",
+            not is_decode and cfg.speculative_algorithm is not None,
+        ),
+        (
+            "context parallelism",
+            cfg.dcp_size != 1
+            or (
+                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+                and (
+                    is_decode
+                    or not cfg.enable_prefill_cp
+                    or cfg.cp_strategy != "interleave"
+                )
+            ),
+        ),
+        ("LoRA", cfg.enable_lora),
+        ("decode radix cache", cfg.disaggregation_decode_enable_radix_cache),
+        ("decode KV offload", cfg.disaggregation_decode_enable_offload_kvcache),
+        ("KV checksums", cfg.disaggregation_enable_kv_checksum),
+    )
+    for feature, enabled in incompatible:
+        if enabled:
+            raise ValueError(
+                f"DeepSeek-V4.1 asymmetric PD does not support {feature}"
+            )
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+
+    # P runs the encoder prefix and D extends the tail eagerly. Only the
+    # prefill phase is disabled, so steady-state decode can still use graphs.
+    declare_resolution(
+        server_args,
+        "resolve_deepseek_v41_asymmetric_pd",
+        enable_decoder_swa_bounded_replay=is_decode,
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+        ),
+    )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
@@ -337,9 +431,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
-            ("DP attention", cfg.enable_dp_attention and cfg.dp_size > 1),
+            # Encoder-only decode already receives only the live tail. With
+            # DeepEP and attention TP1, IDs are local and need no DP-wide slice.
+            (
+                "DP attention",
+                cfg.enable_dp_attention
+                and cfg.dp_size > 1
+                and not (
+                    cfg.dsv41_encoder_only_prefill
+                    and cfg.disaggregation_mode == "decode"
+                    and cfg.moe_a2a_backend == "deepep"
+                    and cfg.dp_size == cfg.tp_size == cfg.ep_size
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

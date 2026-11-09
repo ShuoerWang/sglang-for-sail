@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import (
+    DSV41_PREFIX_LEN_SLOT,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -60,6 +61,9 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    dsv41_encoder_only_prefill_enabled,
+    dsv41_encoder_only_unsupported,
+    dsv41_encoder_prefix_len,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -73,6 +77,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -760,6 +765,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             is_retracted = False
             is_rebootstrap = True
 
+        if dsv41_encoder_only_prefill_enabled() and not is_retracted:
+            unsupported = dsv41_encoder_only_unsupported(req)
+            if unsupported is not None:
+                prepare_abort(
+                    req,
+                    f"DeepSeek-V4.1 asymmetric PD does not support {unsupported}",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return
+            # Prefill sends the encoder prefix; the tail extend here runs the rest.
+            # A rebootstrap's prefill also covers the emitted tokens except the
+            # boundary token, which the tail replays.
+            req.dsv41_tail_start = dsv41_encoder_prefix_len(
+                self._rebootstrap_prefill_len(req),
+                self.scheduler.model_config.sliding_window_size,
+            )
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -874,6 +897,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
+        if dsv41_encoder_only_prefill_enabled() and req.dsv41_tail_start is not None:
+            # Only the transferred encoder prefix; the tail extend allocates the
+            # rest like a later prefill chunk.
+            return req.dsv41_tail_start
         if getattr(req, "pd_rebootstrap_in_progress", False):
             # pause_generation(retract) already popped the boundary token out of
             # output_ids (it is replayed via the decode-side override at commit
@@ -1544,6 +1571,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=num_device_preallocated + 1,
                 )
             decode_req.req.kv.cache_protected_len = total_prefix_len
+            if (
+                dsv41_encoder_only_prefill_enabled()
+                and decode_req.req.dsv41_tail_start is not None
+            ):
+                # Prefill sends only the encoder prefix; the rest runs here.
+                origin_input_len = decode_req.req.dsv41_tail_start
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -2401,6 +2434,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
+    @staticmethod
+    def _commit_cached_tokens(req: Req, cached_tokens: torch.Tensor) -> None:
+        req.cached_tokens = cached_tokens[0].item()
+        # The prefill node already reported its prefix-cache hit in
+        # cached_tokens[0]. Seed already_computed with it so that
+        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
+        # only adds decode-side reuse *beyond* what prefill counted, instead of
+        # double-counting the shared prompt prefix (which would make
+        # cached_tokens exceed prompt_tokens when decode radix cache is on).
+        req.already_computed = req.cached_tokens
+        req.cached_tokens_device = cached_tokens[1].item()
+        req.cached_tokens_host = cached_tokens[2].item()
+        req.cached_tokens_storage = cached_tokens[3].item()
+        # Multimodal prompt token counts packed into cached_tokens slots 4-6
+        # by the prefill node (see MetadataBuffers.set_buf).
+        req.mm_image_tokens = cached_tokens[4].item()
+        req.mm_audio_tokens = cached_tokens[5].item()
+        req.mm_video_tokens = cached_tokens[6].item()
+        req.mm_token_counts_ready = True
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         # Preserve the checksum before the metadata slot is freed so it can be
         # re-verified when the request enters a batch, including after retraction.
@@ -2476,6 +2529,36 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        if (
+            dsv41_encoder_only_prefill_enabled()
+            and decode_req.req.dsv41_tail_start is not None
+        ):
+            # Prefill sampled nothing; the tail extend here samples the next token.
+            req = decode_req.req
+            covered = cached_tokens[DSV41_PREFIX_LEN_SLOT].item()
+            if covered != req.dsv41_tail_start:
+                # The tail extend would read KV prefill never wrote, or overwrite it.
+                prepare_abort(
+                    req,
+                    f"Encoder-only prefill covered {covered} prompt tokens, "
+                    f"decode expected {req.dsv41_tail_start}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
+            if req.pd_rebootstrap_forced_output_id is not None:
+                # As in a collocated retraction, the re-prefill takes the emitted
+                # boundary token as input instead of resampling it.
+                req.output_ids.append(req.pd_rebootstrap_forced_output_id)
+                req.pd_rebootstrap_forced_output_id = None
+                req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+            self._commit_cached_tokens(req, cached_tokens)
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            decode_req.req.time_stats.set_wait_queue_entry_time()
+            return
+
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when
@@ -2510,22 +2593,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
                 decode_req.req, committed_output_id
             )
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        # The prefill node already reported its prefix-cache hit in
-        # cached_tokens[0]. Seed already_computed with it so that
-        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
-        # only adds decode-side reuse *beyond* what prefill counted, instead of
-        # double-counting the shared prompt prefix (which would make
-        # cached_tokens exceed prompt_tokens when decode radix cache is on).
-        decode_req.req.already_computed = decode_req.req.cached_tokens
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
-        # Multimodal prompt token counts packed into cached_tokens slots 4-6
-        # by the prefill node (see MetadataBuffers.set_buf).
-        decode_req.req.mm_image_tokens = cached_tokens[4].item()
-        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
-        decode_req.req.mm_video_tokens = cached_tokens[6].item()
+        self._commit_cached_tokens(decode_req.req, cached_tokens)
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -2987,12 +3055,185 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    def _merge_dsv41_tail_extend(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        """Merge the previous step's tail extend into the decode batch.
+
+        As in collocated serving, the merge precedes the extend's result
+        processing under overlap: its first tokens reach the decode inputs
+        through the future map, and finished requests leave in a later filter.
+        """
+        last_batch = self.last_batch
+        if (
+            last_batch is None
+            or last_batch is running_batch
+            or not last_batch.forward_mode.is_extend()
+        ):
+            return running_batch
+        last_batch.filter_batch()
+        if last_batch.is_empty():
+            return running_batch
+        if running_batch.is_empty():
+            return last_batch
+        running_batch.merge_batch(last_batch)
+        return running_batch
+
+    def _get_new_dsv41_tail_extend_batch(
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        max_dispatch_tokens: Optional[int] = None,
+        decode_token_reserve: int = 0,
+    ) -> Optional[ScheduleBatch]:
+        """Run the final window of transferred prompts on top of their prefix.
+
+        The transferred encoder prefix and its SWA window stand where a previous
+        prefill chunk would leave them, so the tail is an ordinary extend; the
+        decoder SWA bounded replay floors the decoder layers at its start.
+        """
+        if not self.waiting_queue:
+            return None
+        last_batch = self.last_batch
+        if last_batch is not None and (
+            (get_parallel().attn_dp_size > 1 and last_batch.is_extend_in_batch)
+            or (
+                not running_batch.is_empty()
+                and last_batch.forward_mode.is_extend()
+            )
+        ):
+            # Alternate with decode so a stream of arrivals cannot starve it.
+            return None
+        num_free_reqs = (
+            min(self.req_to_token_pool.size, self.max_running_requests)
+            - running_batch.batch_size()
+        )
+        page_size = self.token_to_kv_pool_allocator.page_size
+        num_free_tokens = self.token_to_kv_pool_allocator.available_size()
+        can_run_list: List[Req] = []
+        selected_indices = set()
+        num_tokens = num_alloc_tokens = 0
+        for i, req in enumerate(self.waiting_queue):
+            tail_start = req.dsv41_tail_start
+            if tail_start is None:
+                continue
+            fill_len = len(req.full_untruncated_fill_ids)
+            tail_len = fill_len - tail_start
+            alloc_len = ceil_align(fill_len, page_size) - ceil_align(
+                tail_start, page_size
+            )
+            if (
+                len(can_run_list) >= num_free_reqs
+                or num_alloc_tokens + alloc_len > num_free_tokens
+                or (can_run_list and num_tokens + tail_len > self.max_prefill_tokens)
+                or (
+                    max_dispatch_tokens is not None
+                    and num_tokens
+                    + tail_len
+                    + (decode_token_reserve if can_run_list else 0)
+                    > max_dispatch_tokens
+                )
+            ):
+                # Decode frees memory or retracts until the tail fits.
+                break
+            can_run_list.append(req)
+            selected_indices.add(i)
+            num_tokens += tail_len
+            num_alloc_tokens += alloc_len
+        if not can_run_list:
+            return None
+        self.waiting_queue = [
+            req for i, req in enumerate(self.waiting_queue) if i not in selected_indices
+        ]
+
+        for req in can_run_list:
+            if req.kv.kv_allocated_len == 0:
+                # A prompt within one window transferred nothing: extend it whole
+                # in a fresh row, like a new collocated request.
+                self.req_to_token_pool.free(req)
+            prefix_len = req.dsv41_tail_start
+            if prefix_len:
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, :prefix_len
+                ].to(torch.int64)
+            req.set_extend_range(prefix_len, len(req.full_untruncated_fill_ids))
+            # The transferred prefix was computed, not hit; prefill reported its
+            # cache hits already.
+            req.already_computed = prefix_len
+            req._cache_breakdown_computed = True
+            req.dsv41_tail_start = None
+            if getattr(req, "pd_rebootstrap_in_progress", False):
+                req.pd_rebootstrap_in_progress = False
+                # The replayed output tokens are not prompt tokens to score.
+                req.logprob_start_len = max(req.logprob_start_len, req.extend_range.end)
+        set_time_batch(can_run_list, "set_forward_entry_time")
+
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_extend()
+        return new_batch
+
+    def _mix_dsv41_tail_with_decode(
+        self: Scheduler,
+        tail_batch: ScheduleBatch,
+        running_batch: ScheduleBatch,
+        max_dispatch_tokens: Optional[int] = None,
+    ) -> Tuple[ScheduleBatch, ScheduleBatch]:
+        # Match the mixed-chunk scheduler's exclusions for logprobs and beams.
+        if (
+            running_batch.is_empty()
+            or tail_batch.return_logprob
+            or running_batch.return_logprob
+            or any(req.beam_group is not None for req in running_batch.reqs)
+            or (
+                max_dispatch_tokens is not None
+                and tail_batch.extend_num_tokens + running_batch.batch_size()
+                > max_dispatch_tokens
+            )
+        ):
+            return tail_batch, running_batch
+        running_batch = self.update_running_batch(running_batch)
+        if running_batch.is_empty():
+            return tail_batch, running_batch
+
+        if tail_batch.forward_mode.is_idle():
+            # A peer has a tail. Treat our decode rows as one-token extends so
+            # DSPARK and DeepEP run the same forward phases on every rank.
+            tail_batch.prefill_input_ids_cpu = torch.empty(0, dtype=torch.int64)
+            tail_batch.prefix_lens = []
+            tail_batch.extend_lens = []
+            tail_batch.extend_logprob_start_lens = []
+        tail_batch.mix_with_running(running_batch)
+        tail_batch.decoding_reqs = running_batch.reqs
+        if not self.enable_overlap and not self.spec_algorithm.is_none():
+            last_tokens = torch.tensor(
+                [req.output_ids[-1] for req in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.future_map.stash_bonus_tokens(
+                running_batch.req_pool_indices, last_tokens
+            )
+        return tail_batch, ScheduleBatch(
+            reqs=[], batch_is_full=running_batch.batch_is_full
+        )
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
+        encoder_only = dsv41_encoder_only_prefill_enabled()
+        if encoder_only:
+            running_batch = self._merge_dsv41_tail_extend(running_batch)
+
+        # Host-restored requests have finished prefill and can resume decode.
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
@@ -3007,6 +3248,43 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+
+        if encoder_only:
+            max_dispatch_tokens = None
+            if get_moe_a2a_backend().is_deepep() and get_deepep_mode().is_low_latency():
+                max_dispatch_tokens = (
+                    envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                )
+            tail_batch = self._get_new_dsv41_tail_extend_batch(
+                running_batch,
+                max_dispatch_tokens=max_dispatch_tokens,
+                decode_token_reserve=(
+                    running_batch.batch_size() if self.is_mixed_chunk else 0
+                ),
+            )
+            # Tail replay and decode graph replay must stay on separate DP
+            # steps. An empty rank participates with an idle forward.
+            sync_tail = self.require_mlp_sync and get_parallel().attn_dp_size > 1
+            if tail_batch is not None or sync_tail:
+                # The tail is an extend forward; running decodes wait one step.
+                tail_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    tail_batch
+                )
+            if tail_batch is not None:
+                if self.is_mixed_chunk:
+                    tail_batch, running_batch = self._mix_dsv41_tail_with_decode(
+                        tail_batch, running_batch, max_dispatch_tokens
+                    )
+                    # The first sync selected the step. Reconcile the token
+                    # counts again now that running requests have joined it.
+                    if sync_tail:
+                        tail_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                            tail_batch
+                        )
+                set_schedule_time_batch(tail_batch)
+                return NextBatchPlan(
+                    batch_to_run=tail_batch, running_batch=running_batch
+                )
 
         # Schedule decode batch
         if running_batch.is_empty():
@@ -3109,10 +3387,11 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
-            # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+        encoder_only = dsv41_encoder_only_prefill_enabled()
+        for req in self.waiting_queue:
+            if len(can_run_list) < num_not_used_batch and not (
+                encoder_only and req.dsv41_tail_start is not None
+            ):
                 can_run_list.append(req)
                 # `pop_preallocated` matched and locked new requests; a retracted or
                 # rebootstrapped one owns its row, and a re-match here takes no lock.

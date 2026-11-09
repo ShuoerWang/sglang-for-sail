@@ -1068,6 +1068,9 @@ class Req(ReqDllmMixin):
         # extend_range, never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
         self.extend_range: Optional[Range] = None
+        # DeepSeek-V4.1 asymmetric PD decode: the prompt position where
+        # the transferred encoder prefix ends and this worker's extend begins.
+        self.dsv41_tail_start: Optional[int] = None
         self.dllm_initialized: bool = False
 
         self.session = session

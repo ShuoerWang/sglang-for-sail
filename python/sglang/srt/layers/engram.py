@@ -278,13 +278,14 @@ class EngramHasher(nn.Module):
         assert self.history is not None, "EngramHasher.init_history was not called"
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
-        if num_tokens == 0:
-            return torch.empty(
-                (0, self.primes.shape[0], self.offsets.shape[1]),
-                dtype=torch.int64,
-                device=input_ids.device,
-            )
         mode = forward_batch.forward_mode
+        if num_tokens == 0 or mode.is_idle():
+            # DP can pad idle ranks to the token count of the active ranks.
+            # Keep the lookup shape without updating request history.
+            return input_ids.new_zeros(
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
+                dtype=torch.int64,
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device

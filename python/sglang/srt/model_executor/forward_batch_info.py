@@ -634,6 +634,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    mixed_decode_token_range: Optional[Tuple[int, int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For DP attention (MLP sync sizes)
@@ -1131,6 +1132,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+            if batch.forward_mode == ForwardMode.MIXED and batch.decoding_reqs:
+                ret.mixed_decode_token_range = (
+                    batch.extend_num_tokens - len(batch.decoding_reqs),
+                    batch.extend_num_tokens,
+                )
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
@@ -2042,6 +2048,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
 
+        elif logits_output is None:
+            # The model stops before the head (encoder-only PD prefill).
+            return
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:

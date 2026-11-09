@@ -117,6 +117,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -1327,6 +1328,10 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        planner_head_dim = self.index_head_dim
+        if compress_ratio in (1, 2) and is_ppu() and not use_dsv41_int8_indexer():
+            # The PPU DeepGEMM planner and kernel both tile by packed Q width.
+            planner_head_dim //= 2
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
@@ -1347,7 +1352,7 @@ class DeepseekV4AttnBackend(
                     c_seq_lens.shape[0],
                     1,
                     self.index_n_heads,
-                    self.index_head_dim,
+                    planner_head_dim,
                 )
             ),
         )
@@ -1551,6 +1556,7 @@ class DeepseekV4AttnBackend(
             and is_sm100_or_newer()
             and get_parallel().attn_cp_size == 1
             and not use_dsv41_int8_indexer()
+            and not get_disagg().dsv41_encoder_only_prefill
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -1569,14 +1575,27 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
         device = forward_batch.out_cache_loc.device
+        split_decode = (
+            get_disagg().dsv41_encoder_only_prefill
+            and get_disagg().disaggregation_mode == "decode"
+        )
+        # The transferred prefix is even, so decode's live tail can be 129
+        # tokens. Keep all live rows and floor SWA at the transfer boundary.
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
-            tail_len=SWA_WINDOW,
+            tail_len=max(extend_lens_cpu, default=0) if split_decode else SWA_WINDOW,
             device=device,
         )
+        if split_decode and forward_batch.mixed_decode_token_range is not None:
+            # Existing decode rows already have their late-layer SWA history.
+            # Only new prompt tails need to be floored at the handoff boundary.
+            start, end = forward_batch.mixed_decode_token_range
+            swa_replay_start[start:end] = 0
         contiguous_start = (
-            extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
+            extend_lens_cpu[0] - tail_lens_cpu[0]
+            if not split_decode and len(extend_lens_cpu) == 1
+            else None
         )
         out_cache_loc = _tail_rows(
             forward_batch.out_cache_loc,
@@ -3017,6 +3036,9 @@ class DeepseekV4AttnBackend(
         freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
         kv_cache = pool.get_extra_key_buffer(layer_id)
         page_size = pool.get_extra_key_page_size(layer_id)
+        # Bucket-sized under the prefill graph; an eager break passes live rows.
+        num_tokens = pos.shape[0]
+        raw_out_loc = core.raw_out_loc[:num_tokens]
         # The pool's page format: V4, or the V4.1 fp8 / fp4 layouts.
         kv_layout = pool.get_extra_key_layout(layer_id)
         assert kv_cache is not None
@@ -3027,7 +3049,7 @@ class DeepseekV4AttnBackend(
                 compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3045,7 +3067,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,

@@ -1520,7 +1520,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
         return self._unified_page_views(self.unified_kv_pool.kv_buffer_rope, ratio)
 
-    def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+    def get_state_buf_infos(
+        self, swa_layer_end: Optional[int] = None
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """``swa_layer_end`` keeps only the SWA of the layers before it."""
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
@@ -1529,7 +1532,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             physical_pages_per_logical_page = (
                 self.swa_page_size // self.swa_kv_pool.page_size
             )
-            for buf in self.swa_kv_pool.kv_buffer:
+            buffers = self.swa_kv_pool.kv_buffer
+            if swa_layer_end is not None:
+                buffers = buffers[: max(0, swa_layer_end - self._stage_start)]
+            for buf in buffers:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)

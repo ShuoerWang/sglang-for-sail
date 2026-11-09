@@ -386,7 +386,7 @@ class EagerRunner(BaseRunner):
 
     def _execute_extend_cp(
         self, forward_batch: ForwardBatch, kwargs: dict
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, None]:
         """CP extend: shard inputs at the model boundary, run the body on the
         rank-local slice, then gather hidden states before the logits step.
         """
@@ -415,6 +415,9 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 **model_kwargs,
             )
+        # Encoder-only Prefill finishes after writing KV and has no logits.
+        if hidden_states is None:
+            return None
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:

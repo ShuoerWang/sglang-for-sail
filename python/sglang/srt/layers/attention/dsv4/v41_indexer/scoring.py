@@ -175,7 +175,10 @@ def get_deep_gemm_prefill_data(
             continue
         j = torch.arange(lc, device=device)
         slot_chunks.append(
-            req_to_token[req_pool_indices[r], j * ratio].to(torch.int64) // ratio
+            # Keep the row index one-dimensional so PyTorch does not read
+            # a device scalar on the host while scheduling ranks are in flight.
+            req_to_token[req_pool_indices[r : r + 1], j * ratio].to(torch.int64)
+            // ratio
         )
         start += lc
     num_tokens = pos.shape[0]

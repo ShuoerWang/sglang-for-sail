@@ -116,6 +116,10 @@ class Disagg(msgspec.Struct):
     optimistic_prefill_attempts: A[
         int, "Number of optimistic prefill forward passes that skip the bootstrap wait."
     ] = 0
+    dsv41_encoder_only_prefill: A[
+        bool,
+        "Use asymmetric Mooncake PD for DeepSeek-V4.1-Flash. Set on both P and D.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

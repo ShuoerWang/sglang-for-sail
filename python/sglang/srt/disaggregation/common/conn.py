@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    dsv41_encoder_only_prefill_enabled,
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
@@ -117,6 +118,7 @@ class PrefillServerInfo:
     target_pp_ranks: Optional[List[int]] = None
     required_dst_info_num: Optional[int] = None
     required_prefill_response_num: Optional[int] = None
+    dsv41_encoder_only_prefill: bool = False
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
@@ -975,6 +977,10 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        if info.dsv41_encoder_only_prefill != dsv41_encoder_only_prefill_enabled():
+            raise RuntimeError(
+                "--dsv41-encoder-only-prefill must match on both P and D servers"
+            )
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1185,6 +1191,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "dsv41_encoder_only_prefill": dsv41_encoder_only_prefill_enabled(),
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
@@ -2120,6 +2127,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.dsv41_encoder_only_prefill = False
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -2198,6 +2206,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=400,
             )
         self.dsv41_spec_layout = dsv41_spec_layout
+        encoder_only = data.get("dsv41_encoder_only_prefill", False)
+        if self._registered_count and self.dsv41_encoder_only_prefill != encoder_only:
+            return web.Response(
+                text="--dsv41-encoder-only-prefill differs across prefill ranks",
+                status=400,
+            )
+        self.dsv41_encoder_only_prefill = encoder_only
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2290,6 +2305,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                dsv41_encoder_only_prefill=self.dsv41_encoder_only_prefill,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -2301,6 +2317,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if not info.dsv41_encoder_only_prefill:
+                payload.pop("dsv41_encoder_only_prefill")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
