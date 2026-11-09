@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_model,
     get_parallel,
+    get_resources,
     get_server_args,
     get_spec,
 )
@@ -1035,3 +1036,13 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+@contextmanager
+def draft_expert_placement_context():
+    """Load draft weights without the target's placement or redundant experts."""
+    with (
+        get_resources().override(expert_location_metadata=None),
+        get_exec().moe.override(ep_num_redundant_experts=0),
+    ):
+        yield

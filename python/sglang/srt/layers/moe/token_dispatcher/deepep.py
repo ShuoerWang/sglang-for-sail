@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -189,26 +190,123 @@ class DeepEPDispatchMode(IntEnum):
     LOW_LATENCY = auto()
 
 
+class _DeepEPBufferInitArgs(NamedTuple):
+    group: dist.ProcessGroup
+    hidden_size: int
+    param_bytes: int
+    deepep_mode: DeepEPMode
+    num_max_dispatch_tokens_per_rank: int
+    num_experts: int
+
+
 class DeepEPBuffer:
     """Managing facade for the process-wide DeepEP comm buffer; the state
     itself lives on ``ctx.resources`` (one entry per process)."""
+
+    _STATE_KEY = "deepep_ep_state"
 
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
 
         buffers = get_resources().buffers
-        state = buffers.get("deepep_ep_state")
+        state = buffers.get(cls._STATE_KEY)
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
+                buffer_init_args=None,
+                buffer_init_key=None,
                 dispatch_mode=None,
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
+                low_latency_layout=None,
             )
-            buffers["deepep_ep_state"] = state
+            buffers[cls._STATE_KEY] = state
         return state
+
+    @staticmethod
+    def _format_init_key(init_args: _DeepEPBufferInitArgs) -> str:
+        return (
+            f"group_id={id(init_args.group)}, hidden_size={init_args.hidden_size}, "
+            f"param_bytes={init_args.param_bytes}, mode={init_args.deepep_mode}, "
+            "num_max_dispatch_tokens_per_rank="
+            f"{init_args.num_max_dispatch_tokens_per_rank}, "
+            f"num_experts={init_args.num_experts}"
+        )
+
+    @classmethod
+    def _bind_init_args(cls, state, init_args: _DeepEPBufferInitArgs) -> None:
+        if state.buffer_init_key is None:
+            state.buffer_init_key = init_args
+        elif state.buffer_init_key != init_args:
+            capacity = state.buffer_init_key
+            # Target and draft share the target's larger low-latency allocation.
+            # Layout transitions clean the incoming control words before use.
+            if (
+                capacity.deepep_mode in (DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO)
+                and 0 < init_args.num_experts <= capacity.num_experts
+                and init_args.num_experts % init_args.group.size() == 0
+                and init_args._replace(num_experts=capacity.num_experts) == capacity
+            ):
+                return
+            raise ValueError(
+                "DeepEP uses one process-wide buffer, but dispatchers requested "
+                "conflicting initialization parameters: "
+                f"bound=({cls._format_init_key(state.buffer_init_key)}), "
+                f"requested=({cls._format_init_key(init_args)})."
+            )
+
+        if state.buffer is None and state.buffer_init_args is None:
+            state.buffer_init_args = init_args
+
+    @classmethod
+    def prepare_deepep_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        param_bytes: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+    ) -> None:
+        """Record the one process-wide buffer configuration without allocating.
+
+        Smaller low-latency expert layouts may share the registered capacity.
+        Other geometry mismatches cannot share the process-global communicator
+        and are rejected at startup.
+        """
+
+        state = cls._state()
+        cls._bind_init_args(
+            state,
+            _DeepEPBufferInitArgs(
+                group,
+                hidden_size,
+                param_bytes,
+                deepep_mode,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+            ),
+        )
+
+    @classmethod
+    def initialize_deepep_buffer(cls):
+        """Materialize a prepared buffer before KV sizing and graph capture."""
+
+        state = cls._state()
+        if state.buffer is not None:
+            state.buffer_init_args = None
+            return state.buffer
+        if state.buffer_init_args is None:
+            return None
+
+        # Keep the pending arguments until the constructor and its setup have
+        # succeeded. A startup failure remains diagnosable and retryable.
+        init_args = state.buffer_init_args
+        buffer = cls.get_deepep_buffer(*init_args)
+        state.buffer_init_args = None
+        return buffer
 
     @classmethod
     def get_deepep_buffer(
@@ -221,9 +319,127 @@ class DeepEPBuffer:
         num_experts: int = -1,
     ):
         state = cls._state()
+        init_args = _DeepEPBufferInitArgs(
+            group,
+            hidden_size,
+            param_bytes,
+            deepep_mode,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+        )
+        cls._bind_init_args(state, init_args)
         if state.buffer is not None:
             return state.buffer
 
+        # A smaller draft dispatcher may be the first caller to materialize
+        # storage. Always allocate the registered target capacity.
+        (
+            group,
+            hidden_size,
+            param_bytes,
+            deepep_mode,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+        ) = state.buffer_init_key
+
+        num_nvl_bytes, num_rdma_bytes = 0, 0
+        if deepep_mode.enable_normal():
+            hidden_bytes = hidden_size * param_bytes
+            for config in (
+                DeepEPConfig.get_instance().normal_dispatch_config
+                or Buffer.get_dispatch_config(group.size()),
+                DeepEPConfig.get_instance().normal_combine_config
+                or Buffer.get_combine_config(group.size()),
+            ):
+                num_nvl_bytes = max(
+                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
+                    num_nvl_bytes,
+                )
+                num_rdma_bytes = max(
+                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                    num_rdma_bytes,
+                )
+        if deepep_mode.enable_low_latency():
+            assert num_max_dispatch_tokens_per_rank != -1
+            assert num_experts != -1 and num_experts % group.size() == 0
+            if not _is_npu:
+                _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank)
+            num_rdma_bytes = max(
+                Buffer.get_low_latency_rdma_size_hint(
+                    num_max_dispatch_tokens_per_rank,
+                    hidden_size,
+                    group.size(),
+                    num_experts,
+                ),
+                num_rdma_bytes,
+            )
+
+        # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
+        if deepep_mode == DeepEPMode.NORMAL:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms
+        elif deepep_mode == DeepEPMode.LOW_LATENCY:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
+            num_qps_per_rank = num_experts // group.size()
+        elif deepep_mode == DeepEPMode.AUTO:
+            # low-latency and normal mode all need run
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = max(
+                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
+            )
+        else:
+            raise NotImplementedError
+
+        if not _is_npu:
+            total_num_sms = torch.cuda.get_device_properties(
+                device="cuda"
+            ).multi_processor_count
+            if (
+                (deepep_mode != DeepEPMode.LOW_LATENCY)
+                and not is_tbo_enabled()
+                and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
+            ):
+                logger.warning(
+                    f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
+                    f"This may result in highly suboptimal performance. "
+                    f"Consider using --deepep-config to change the behavior."
+                )
+
+        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
+
+        # PPU uses allow_mnnvl to select its SAILSHMEM low-latency transport.
+        # That transport is independent of CUDA MNNVL fabric handles, whose
+        # use remains controlled separately by use_mnnvl_fabric below.
+        allow_mnnvl = True if _is_ppu else use_mnnvl_fabric
+        buffer_kwargs = dict(
+            low_latency_mode=deepep_mode.enable_low_latency(),
+            num_qps_per_rank=num_qps_per_rank,
+            allow_mnnvl=allow_mnnvl,
+        )
+        # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
+        # support, so cross-pod GB200/GB300 EP groups use
+        # cuMemImportFromShareableHandle instead of the intra-node-only
+        # cudaIpcOpenMemHandle. Only some DeepEP builds expose this as a kwarg
+        # (hybrid-ep does; fzyzcjy/DeepEP auto-enables fabric in C++, while the
+        # PPU build has no such parameter). Probe the installed API instead of
+        # inferring it from the CUDA version.
+        # https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
+        if use_mnnvl_fabric and DEEPEP_SUPPORT_USE_FABRIC:
+            buffer_kwargs["use_fabric"] = True
+
+        buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        if DEEPEP_SUPPORT_TIMEOUT_CONTROL:
+            timeout = envs.SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT.get()
+            buffer.set_timeout_seconds(timeout)
+
+        # Publish only after collective construction and setup have succeeded.
+        state.buffer = buffer
+        state.low_latency_layout = (
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            num_experts,
+        )
+        state.buffer_init_args = None
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
@@ -309,37 +525,46 @@ class DeepEPBuffer:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        state.low_latency_layout = (
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            num_experts,
+        )
         if DEEPEP_SUPPORT_TIMEOUT_CONTROL:
             timeout = envs.SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT.get()
             state.buffer.set_timeout_seconds(timeout)
         return state.buffer
 
     @classmethod
-    def clean_buffer(cls):
+    def clean_buffer(cls, layout=None):
         state = cls._state()
         if not state.buffer.low_latency_mode:
             return
-        state.buffer.clean_low_latency_buffer(
-            state.num_max_dispatch_tokens_per_rank,
-            state.hidden_size,
-            state.num_experts,
-        )
+        state.buffer.clean_low_latency_buffer(*(layout or state.low_latency_layout))
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
         cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
-    def set_dispatch_mode_as_low_latency(cls):
+    def set_dispatch_mode_as_low_latency(cls, layout=None):
         state = cls._state()
-        if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
-            cls.clean_buffer()
+        layout = layout or state.low_latency_layout
+        # Target and draft can share storage but have different expert counts.
+        # Their control words occupy different offsets; the outgoing payload
+        # must not be interpreted as incoming receive counts.
+        if state.buffer is not None and (
+            state.dispatch_mode == DeepEPDispatchMode.NORMAL
+            or layout != state.low_latency_layout
+        ):
+            cls.clean_buffer(layout)
+        state.low_latency_layout = layout
         state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
     @classmethod
-    def set_dispatch_mode(cls, mode: DeepEPMode):
+    def set_dispatch_mode(cls, mode: DeepEPMode, low_latency_layout=None):
         if mode.is_low_latency():
-            cls.set_dispatch_mode_as_low_latency()
+            cls.set_dispatch_mode_as_low_latency(low_latency_layout)
         elif mode.is_normal():
             cls.set_dispatch_mode_as_normal()
         else:
@@ -396,7 +621,12 @@ class _DeepEPDispatcherImplBase:
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
-        self.num_experts = num_experts
+        expert_metadata = get_global_expert_location_metadata()
+        self.num_experts = (
+            expert_metadata.num_physical_experts
+            if expert_metadata is not None
+            else num_experts
+        )
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
@@ -1066,8 +1296,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_low_latency()
-        return DeepEPBuffer.get_deepep_buffer(
+        buffer = DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
@@ -1075,6 +1304,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+        DeepEPBuffer.set_dispatch_mode_as_low_latency(
+            (self.num_max_dispatch_tokens_per_rank, self.hidden_size, self.num_experts)
+        )
+        return buffer
 
 
 @dataclass
@@ -1083,6 +1316,44 @@ class _Stage(Enum):
     AFTER_DISPATCH_A = auto()
     AFTER_DISPATCH_B = auto()
     AFTER_COMBINE_A = auto()
+
+
+class _IncrementalEPLBDeepEPBufferProxy:
+    """IncrementalEPLB target adapter; decode-scoped callbacks are otherwise inert."""
+
+    def __init__(self, buffer, layer_id, dispatch_counts_buffer):
+        self._buffer = buffer
+        self._layer_id = layer_id
+        self._dispatch_counts_buffer = dispatch_counts_buffer
+
+    def __getattr__(self, name):
+        return getattr(self._buffer, name)
+
+    def low_latency_dispatch(self, *args, **kwargs):
+        kwargs["cumulative_local_expert_recv_stats"] = self._dispatch_counts_buffer(
+            self._layer_id
+        )
+        return self._buffer.low_latency_dispatch(*args, **kwargs)
+
+
+class _IncrementalEPLBDeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplLowLatency):
+    """Low-latency dispatcher variant that records expert receive counts."""
+
+    def __init__(self, layer_id: int, **kwargs):
+        super().__init__(**kwargs)
+        from sglang.srt.eplb.incremental.decode_bindings import (
+            dispatch_counts_buffer,
+        )
+
+        self._incremental_eplb_buffer = _IncrementalEPLBDeepEPBufferProxy(
+            None,
+            layer_id,
+            dispatch_counts_buffer,
+        )
+
+    def _get_buffer(self):
+        self._incremental_eplb_buffer._buffer = super()._get_buffer()
+        return self._incremental_eplb_buffer
 
 
 class DeepEPDispatcher(BaseDispatcher):
@@ -1098,6 +1369,8 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        layer_id=None,
+        collect_incremental_eplb_stats=False,
     ):
         super().__init__()
 
@@ -1115,9 +1388,26 @@ class DeepEPDispatcher(BaseDispatcher):
         )
 
         if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
-                return_recv_hook=return_recv_hook,
-                **common_kwargs,
+            if collect_incremental_eplb_stats:
+                self._low_latency_dispatcher = (
+                    _IncrementalEPLBDeepEPDispatcherImplLowLatency(
+                        layer_id=layer_id,
+                        return_recv_hook=return_recv_hook,
+                        **common_kwargs,
+                    )
+                )
+            else:
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                    return_recv_hook=return_recv_hook, **common_kwargs
+                )
+            impl = self._low_latency_dispatcher
+            DeepEPBuffer.prepare_deepep_buffer(
+                group,
+                hidden_size,
+                impl.params_bytes,
+                deepep_mode,
+                impl.num_max_dispatch_tokens_per_rank,
+                impl.num_experts,
             )
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
