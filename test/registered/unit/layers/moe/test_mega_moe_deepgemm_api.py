@@ -22,6 +22,9 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 class TestDeepGemmMegaMoeApi(CustomTestCase):
     def setUp(self):
         super().setUp()
+        cuda_backend = patch.object(mega_moe, "_is_ppu", False)
+        cuda_backend.start()
+        self.addCleanup(cuda_backend.stop)
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         self.deep_gemm = ModuleType("deep_gemm")
         self.deep_gemm.num_sms = 132
@@ -194,6 +197,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(
+                "sglang.srt.layers.quantization.mxfp4._is_ppu", False
+            ),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
             # Toy shapes.
             patch.object(mega_moe, "check_mega_moe_shapes"),

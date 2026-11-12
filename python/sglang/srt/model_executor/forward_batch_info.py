@@ -638,6 +638,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
+    mega_moe_global_num_tokens: Optional[int] = None
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
     _original_num_tokens: Optional[int] = None
@@ -1010,6 +1011,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
+            mega_moe_global_num_tokens=(
+                batch.mega_moe_global_num_tokens
+                if not model_runner.is_draft_worker and batch.spec_info is None
+                else None
+            ),
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,

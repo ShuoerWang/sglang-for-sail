@@ -560,6 +560,18 @@ def prepare_mlp_sync_batch_raw(
             draft_require_mlp_tp_gather,
             skip_global_metadata=not metadata_ready,
         )
+        # MegaMoE can use the full DP counts even when MLP sync keeps only
+        # the local count. With one attention rank per EP rank, the DP sum
+        # is the number of input tokens across this EP group.
+        batch_to_gather.mega_moe_global_num_tokens = (
+            sum(mlp_sync_info.global_num_tokens)
+            if metadata_ready
+            and mlp_sync_info.is_extend_in_batch
+            and not use_world_group
+            and 1 < dp_size == parallel.tp_size == parallel.moe_ep_size
+            and attn_tp_size == parallel.attn_cp_size == 1
+            else None
+        )
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.

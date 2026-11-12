@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -80,6 +82,63 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             tbo_preparer.compute_output.call_args.args[0].tolist(),
             [[1, ForwardMode.DECODE.value]],
         )
+
+    def test_mega_moe_keeps_ep_total_on_active_and_idle_ranks(self):
+        def gather(sync, **kwargs):
+            sync.global_num_tokens = [8, 0]
+            sync.global_num_tokens_for_logprob = [1, 0]
+            sync.is_extend_in_batch = True
+            sync.tp0_info_cpu = torch.zeros((2, 9), dtype=torch.int64)
+            sync.tp0_info_cpu[:, 5] = torch.tensor(
+                [ForwardMode.EXTEND.value, ForwardMode.IDLE.value]
+            )
+
+        active = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_num_tokens=8,
+            extend_lens=[8],
+            extend_logprob_start_lens=[7],
+            batch_size=lambda: 1,
+            return_logprob=False,
+            spec_info=None,
+        )
+        tbo_preparer = Mock()
+        tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.EXTEND.value)
+        tbo_preparer.compute_output.return_value = (None, ForwardMode.EXTEND)
+        parallel = SimpleNamespace(
+            dp_size=2,
+            tp_size=2,
+            moe_ep_size=2,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            tp_group=SimpleNamespace(device_group=object(), device="cpu"),
+        )
+
+        with (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(dp_attn, "get_parallel", return_value=parallel),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(dp_attn.MLPSyncBatchInfo, "all_gather", new=gather),
+        ):
+            for batch, local_tokens in ((active, 8), (None, 0)):
+                with self.subTest(local_tokens=local_tokens):
+                    result = dp_attn.prepare_mlp_sync_batch_raw(
+                        batch,
+                        model_runner=SimpleNamespace(
+                            prefill_cuda_graph_runner=None,
+                            spec_algorithm=SpeculativeAlgorithm.NONE,
+                            model_config=object(),
+                        ),
+                        get_idle_batch=SimpleNamespace,
+                        disable_cuda_graph=True,
+                        require_mlp_tp_gather=False,
+                        disable_overlap_schedule=True,
+                        offload_tags=set(),
+                    )
+                    self.assertEqual(result.global_num_tokens, [local_tokens])
+                    self.assertEqual(result.mega_moe_global_num_tokens, 8)
 
 
 class TestDecodeToExtendConversionVote(CustomTestCase):

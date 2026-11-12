@@ -14,7 +14,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import is_ppu, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +37,14 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         )
     platform = get_platform()
     if not (
-        (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
+        is_ppu()
+        or (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip
     ):
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
-            "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
+            "or an SM100-class GPU (MXFP4 / NVFP4 experts), or a PPU with "
+            "DeepGEMM's MXFP4 complete-call interface; it runs DeepGEMM "
             "kernels over CUDA symmetric memory. On ROCm, set "
             "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
         )

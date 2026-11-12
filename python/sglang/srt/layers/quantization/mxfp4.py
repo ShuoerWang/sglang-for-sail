@@ -1025,6 +1025,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # nopad f8f8 kernel compares physical K and asserts
             # m/k/n mismatch (weight K is packed K/2).
             if _is_ppu:
+                if self.use_mega_moe:
+                    from sglang.srt.layers.moe.mega_moe_ppu import prepare_mega_moe_weights
+
+                    prepare_mega_moe_weights(layer)
+                    layer._mxfp4_backend = "deep_gemm"
+                    return
                 if self.with_bias:
                     w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
                     w2_weight_bias = layer.w2_weight_bias.to(torch.float32)

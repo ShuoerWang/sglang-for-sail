@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -153,6 +154,8 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if _is_ppu:
+        return True
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -269,6 +272,11 @@ def _run_mega_routed(
         intermediate_size=moe.config.moe_intermediate_size,
         top_k=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
         num_tokens=num_tokens,
+        global_num_tokens=(
+            forward_batch.mega_moe_global_num_tokens
+            if _is_ppu and forward_batch is not None and not get_is_capture_mode()
+            else None
+        ),
         activation_clamp=moe.experts.moe_runner_config.swiglu_limit,
         routed_scaling_factor=(
             1.0
@@ -288,10 +296,26 @@ def run_mega_routed_experts(
     intermediate_size: int,
     top_k: int,
     num_tokens: int,
+    global_num_tokens: Optional[int] = None,
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
+    if _is_ppu:
+        from sglang.srt.layers.moe.mega_moe_ppu import run_mega_routed_experts as run_ppu
+
+        return run_ppu(
+            experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            global_num_tokens=global_num_tokens,
+            activation_clamp=activation_clamp,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel
